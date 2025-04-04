@@ -1,13 +1,18 @@
 defmodule Redactly.Notion do
   @moduledoc "Coordinates Notion ticket polling and PII enforcement."
 
+  require Logger
+
   alias Redactly.PII.Scanner
   alias Redactly.Integrations.{Notion, Slack}
   alias Redactly.Notion.{Deleter, Linker}
 
   @spec poll_for_tickets() :: :ok
   def poll_for_tickets do
-    db_id = System.fetch_env!("NOTION_DATABASE_ID")
+    db_id = Application.fetch_env!(:redactly, :notion)[:database_id]
+
+    Logger.info("[Notion] Polling database #{db_id}")
+
     pages = Notion.query_database(db_id)
 
     Enum.each(pages, fn page ->
