@@ -20,10 +20,11 @@ defmodule RedactlyWeb.Router do
     get "/", PageController, :home
   end
 
-  # Other scopes may use custom stacks.
-  # scope "/api", RedactlyWeb do
-  #   pipe_through :api
-  # end
+  scope "/api", RedactlyWeb do
+    pipe_through :api
+
+    post "/slack/events", SlackEventController, :event
+  end
 
   # Enable LiveDashboard and Swoosh mailbox preview in development
   if Application.compile_env(:redactly, :dev_routes) do
