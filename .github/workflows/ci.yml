@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+jobs:
+  build:
+    name: Elixir CI
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17.4
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: redactly_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      MIX_ENV: test
+      DATABASE_URL: ecto://postgres:postgres@localhost/redactly_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache deps
+        uses: actions/cache@v3
+        with:
+          path: deps
+          key: deps-${{ runner.os }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      - name: Cache _build
+        uses: actions/cache@v3
+        with:
+          path: _build
+          key: build-${{ runner.os }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: build-${{ runner.os }}-
+
+      - name: Cache Dialyzer PLTs
+        uses: actions/cache@v3
+        with:
+          path: _build/dev/dialyxir_plts
+          key: plt-${{ runner.os }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: plt-${{ runner.os }}-
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.18.3'
+          otp-version: '27.3.1'
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Run Credo
+        run: mix credo
+
+      - name: Run Dialyzer
+        run: MIX_ENV=dev mix dialyzer
+
+      - name: Run tests and coverage
+        run: mix coveralls
