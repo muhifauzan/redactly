@@ -5,14 +5,36 @@ defmodule Redactly.Slack.Ingestor do
 
   require Logger
 
-  @spec handle_event(map()) :: :ok
-  def handle_event(%{"event" => %{"text" => text, "user" => user} = event}) do
-    Logger.info("[Slack] Received message from #{user}: #{inspect(text)}")
+  alias Redactly.{PII.Scanner, Integrations.Slack}
 
-    # TODO: Add call to PII scanner + delete + DM logic
+  @spec handle_event(map()) :: :ok
+  def handle_event(%{
+        "event" => %{
+          "type" => "message",
+          "text" => text,
+          "user" => user_id,
+          "channel" => channel,
+          "ts" => ts
+        }
+      }) do
+    Logger.info("[Slack] Received message from #{user_id}: #{inspect(text)}")
+
+    if Scanner.contains_pii?(text) do
+      Logger.info("[Slack] Detected PII — deleting + notifying #{user_id}")
+
+      Slack.delete_message(channel, ts)
+
+      Slack.send_dm(user_id, """
+      🚨 Your message was removed because it contained PII.
+
+      Please repost without the sensitive information:
+
+      > #{text}
+      """)
+    end
+
     :ok
   end
 
-  @spec handle_event(map()) :: :ok
-  def handle_event(_other), do: :ok
+  def handle_event(_), do: :ok
 end
