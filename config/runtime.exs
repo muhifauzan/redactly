@@ -20,6 +20,15 @@ if System.get_env("PHX_SERVER") do
   config :redactly, RedactlyWeb.Endpoint, server: true
 end
 
+notion_db_id =
+  System.get_env("NOTION_DATABASE_ID") ||
+    raise """
+    Missing environment variable NOTION_DATABASE_ID
+    Set it in your local .env or in your Fly environment variables
+    """
+
+config :redactly, :notion, database_id: notion_db_id
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||
