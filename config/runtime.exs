@@ -20,6 +20,24 @@ if System.get_env("PHX_SERVER") do
   config :redactly, RedactlyWeb.Endpoint, server: true
 end
 
+slack_bot_token =
+  System.get_env("SLACK_BOT_TOKEN") ||
+    raise """
+    Missing environment variable SLACK_BOT_TOKEN
+    Set it in your local .env or as a Fly secret
+    """
+
+slack_user_token =
+  System.get_env("SLACK_USER_TOKEN") ||
+    raise """
+    Missing environment variable SLACK_USER_TOKEN
+    Set it in your local .env or as a Fly secret
+    """
+
+config :redactly, :slack,
+  bot_token: slack_bot_token,
+  user_token: slack_user_token
+
 notion_db_id =
   System.get_env("NOTION_DATABASE_ID") ||
     raise """
