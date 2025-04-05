@@ -24,6 +24,7 @@ defmodule RedactlyWeb.Router do
     pipe_through :api
 
     post "/slack/events", SlackEventController, :event
+    post "/notion/events", NotionEventController, :event
   end
 
   # Enable LiveDashboard and Swoosh mailbox preview in development

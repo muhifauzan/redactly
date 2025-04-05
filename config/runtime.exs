@@ -38,6 +38,13 @@ config :redactly, :slack,
   bot_token: slack_bot_token,
   user_token: slack_user_token
 
+notion_api_token =
+  System.get_env("NOTION_API_TOKEN") ||
+    raise """
+    Missing environment variable NOTION_API_TOKEN
+    Set it in your local .env or as a Fly secret
+    """
+
 notion_db_id =
   System.get_env("NOTION_DATABASE_ID") ||
     raise """
@@ -45,7 +52,9 @@ notion_db_id =
     Set it in your local .env or in your Fly environment variables
     """
 
-config :redactly, :notion, database_id: notion_db_id
+config :redactly, :notion,
+  api_token: notion_api_token,
+  database_id: notion_db_id
 
 if config_env() == :prod do
   database_url =

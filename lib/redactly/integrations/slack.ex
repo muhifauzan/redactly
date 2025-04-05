@@ -47,6 +47,9 @@ defmodule Redactly.Integrations.Slack do
     end
   end
 
+  @spec lookup_user_by_email(String.t()) :: {:ok, String.t()} | :error
+  def lookup_user_by_email(_email), do: :error
+
   defp handle_response({:ok, %Response{status: 200, body: body}}, success_log_fn) do
     case Jason.decode(body) do
       {:ok, %{"ok" => true}} ->

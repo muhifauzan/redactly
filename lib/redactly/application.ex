@@ -17,8 +17,7 @@ defmodule Redactly.Application do
       # Start a worker by calling: Redactly.Worker.start_link(arg)
       # {Redactly.Worker, arg},
       # Start to serve requests, typically the last entry
-      RedactlyWeb.Endpoint,
-      Redactly.Notion.Poller
+      RedactlyWeb.Endpoint
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

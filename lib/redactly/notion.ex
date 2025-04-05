@@ -1,45 +1,43 @@
 defmodule Redactly.Notion do
-  @moduledoc "Coordinates Notion ticket polling and PII enforcement."
+  @moduledoc "Coordinates Notion ticket updates and PII enforcement."
 
   require Logger
 
   alias Redactly.PII.Scanner
   alias Redactly.Integrations.{Notion, Slack}
-  alias Redactly.Notion.{Deleter, Linker}
 
-  @spec poll_for_tickets() :: :ok
-  def poll_for_tickets do
-    db_id = Application.fetch_env!(:redactly, :notion)[:database_id]
+  @spec handle_updated_page(String.t(), String.t()) :: :ok
+  def handle_updated_page(page_id, author_id) do
+    Logger.info("[Notion] Handling update for page #{page_id}")
 
-    Logger.info("[Notion] Polling database #{db_id}")
+    case Notion.fetch_page(page_id) do
+      {:ok, page} ->
+        content = Notion.extract_content(page)
 
-    pages = Notion.query_database(db_id)
+        if Scanner.contains_pii?(content) do
+          Logger.info("[Notion] Detected PII — deleting page #{page_id}")
+          Notion.delete_page(page_id)
 
-    Enum.each(pages, fn page ->
-      content = Notion.extract_content(page)
+          user_email = Notion.fetch_user_email(author_id)
 
-      if Scanner.contains_pii?(content) do
-        page_id = page["id"]
-        Deleter.delete_page(page_id)
+          case Slack.lookup_user_by_email(user_email) do
+            {:ok, slack_id} ->
+              Slack.send_dm(slack_id, """
+              🚨 Your Notion ticket was removed because it contained PII.
 
-        user_email = Notion.extract_author_email(page)
+              Please recreate the ticket without sensitive information:
 
-        case Linker.slack_user_id_from_email(user_email) do
-          {:ok, slack_id} ->
-            Slack.send_dm(slack_id, """
-            🚨 Your Notion ticket was removed because it contained PII.
+              > #{content}
+              """)
 
-            Please recreate the ticket without sensitive information:
-
-            > #{content}
-            """)
-
-          :error ->
-            # Optional: log or report failure to link
-            :noop
+            :error ->
+              Logger.warning("[Notion] Could not map author email to Slack ID: #{user_email}")
+          end
         end
-      end
-    end)
+
+      {:error, reason} ->
+        Logger.error("[Notion] Skipping page #{page_id} due to fetch failure: #{inspect(reason)}")
+    end
 
     :ok
   end
