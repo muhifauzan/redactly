@@ -48,7 +48,30 @@ defmodule Redactly.Integrations.Slack do
   end
 
   @spec lookup_user_by_email(String.t()) :: {:ok, String.t()} | :error
-  def lookup_user_by_email(_email), do: :error
+  def lookup_user_by_email(email) do
+    url = "#{@slack_api}/users.lookupByEmail?email=#{URI.encode_www_form(email)}"
+
+    case Finch.build(:get, url, bot_auth_headers())
+         |> Finch.request(Redactly.Finch) do
+      {:ok, %Response{status: 200, body: body}} ->
+        case Jason.decode(body) do
+          {:ok, %{"ok" => true, "user" => %{"id" => slack_id}}} ->
+            {:ok, slack_id}
+
+          {:ok, %{"error" => error}} ->
+            Logger.error("[Slack] Failed to find user by email: #{error}")
+            :error
+
+          _ ->
+            Logger.error("[Slack] Unexpected response body during email lookup")
+            :error
+        end
+
+      {:error, reason} ->
+        Logger.error("[Slack] Error looking up user by email: #{inspect(reason)}")
+        :error
+    end
+  end
 
   defp handle_response({:ok, %Response{status: 200, body: body}}, success_log_fn) do
     case Jason.decode(body) do
