@@ -20,6 +20,15 @@ if System.get_env("PHX_SERVER") do
   config :redactly, RedactlyWeb.Endpoint, server: true
 end
 
+openai_api_key =
+  System.get_env("OPENAI_API_KEY") ||
+    raise """
+    Missing environment variable OPENAI_API_KEY
+    Set it in your local .env or as a Fly secret
+    """
+
+config :redactly, :openai, api_key: openai_api_key
+
 slack_bot_token =
   System.get_env("SLACK_BOT_TOKEN") ||
     raise """

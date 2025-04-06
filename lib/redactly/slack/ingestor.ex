@@ -26,27 +26,39 @@ defmodule Redactly.Slack.Ingestor do
 
     Logger.info("[Slack] Received message from #{user}: #{inspect(text)}")
 
-    if Scanner.contains_pii?(text) do
-      Logger.info("[Slack] Detected PII — attempting to remove")
+    case Scanner.scan(text) do
+      {:ok, pii_items} ->
+        Logger.info("[Slack] Detected PII — attempting to remove")
+        Logger.debug("[Slack] Detected PII: #{inspect(pii_items)}")
 
-      case Slack.delete_message(channel, ts) do
-        :ok ->
-          Logger.info("[Slack] Message deleted successfully")
+        case Slack.delete_message(channel, ts) do
+          :ok ->
+            Logger.info("[Slack] Message deleted successfully")
 
-        {:error, reason} ->
-          Logger.warning("[Slack] Could not delete message: #{inspect(reason)}")
-      end
+          {:error, reason} ->
+            Logger.warning("[Slack] Could not delete message: #{inspect(reason)}")
+        end
 
-      Slack.send_dm(user, """
-      🚨 Your message was removed because it contained PII.
+        Slack.send_dm(user, """
+        🚨 Your message was removed because it contained PII.
 
-      Please repost without the sensitive information:
+        Flagged items:
 
-      > #{text}
-      """)
+        - #{Enum.join(pii_items, "\n- ")}
+
+        Original message:
+
+        > #{text}
+        """)
+
+      :empty ->
+        Logger.debug("[Slack] No PII detected")
+        :ok
+
+      {:error, reason} ->
+        Logger.error("[Slack] Failed to scan for PII: #{inspect(reason)}")
+        :ok
     end
-
-    :ok
   end
 
   def handle_event(event) do

@@ -1,13 +1,20 @@
 defmodule Redactly.PII.Scanner do
   @moduledoc """
-  Uses AI to determine if a message or ticket contains PII.
+  Uses OpenAI to detect PII in messages and tickets.
   """
 
-  @type text :: String.t()
+  alias Redactly.Integrations.OpenAI
 
-  @spec contains_pii?(text()) :: boolean()
-  def contains_pii?(_content) do
-    # TODO: Implement OpenAI call to detect PII
-    false
+  @type pii :: String.t()
+
+  @spec scan(String.t()) :: {:ok, list(pii)} | :empty
+  def scan(text) when is_binary(text) and byte_size(text) > 0 do
+    case OpenAI.detect_pii(text) do
+      {:ok, []} -> :empty
+      {:ok, items} -> {:ok, items}
+      {:error, _reason} -> :empty
+    end
   end
+
+  def scan(_), do: :empty
 end
