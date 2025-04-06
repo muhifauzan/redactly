@@ -29,6 +29,10 @@ defmodule Redactly.PII.Scanner do
         {:ok, items} ->
           Logger.info("[Scanner] PII detected: #{inspect(items)}")
           {:ok, items}
+
+        :empty ->
+          Logger.info("[Scanner] No PII detected.")
+          :empty
       end
     end
   end
