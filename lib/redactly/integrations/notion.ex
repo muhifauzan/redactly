@@ -104,6 +104,40 @@ defmodule Redactly.Integrations.Notion do
     end
   end
 
+  @spec fetch_block_texts(String.t()) :: String.t()
+  def fetch_block_texts(page_id) do
+    url = "#{@notion_api}/blocks/#{page_id}/children?page_size=100"
+
+    case Finch.build(:get, url, headers())
+         |> Finch.request(Redactly.Finch) do
+      {:ok, %Finch.Response{status: 200, body: body}} ->
+        case Jason.decode(body) do
+          {:ok, %{"results" => blocks}} ->
+            blocks
+            |> Enum.flat_map(&extract_block_text/1)
+            |> Enum.join("\n")
+
+          _ ->
+            Logger.error("[Notion] Unexpected response body when fetching blocks")
+            ""
+        end
+
+      {:ok, %Finch.Response{status: status, body: body}} ->
+        Logger.error("[Notion] Failed to fetch blocks (#{status}): #{body}")
+        ""
+
+      {:error, reason} ->
+        Logger.error("[Notion] Error fetching blocks: #{inspect(reason)}")
+        ""
+    end
+  end
+
+  defp extract_block_text(%{"type" => "paragraph", "paragraph" => %{"rich_text" => rich_text}}) do
+    Enum.map(rich_text, fn %{"plain_text" => text} -> text end)
+  end
+
+  defp extract_block_text(_), do: []
+
   defp extract_property(%{"type" => "rich_text", "rich_text" => rich_text}) do
     Enum.map(rich_text, fn %{"plain_text" => text} -> text end) |> Enum.join()
   end

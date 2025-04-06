@@ -29,7 +29,7 @@ defmodule Redactly.Slack.Ingestor do
     case Scanner.scan(text) do
       {:ok, pii_items} ->
         Logger.info("[Slack] Detected PII — attempting to remove")
-        Logger.debug("[Slack] Detected PII: #{inspect(pii_items)}")
+        Logger.debug("[Slack] Detected PII items: #{inspect(pii_items)}")
 
         case Slack.delete_message(channel, ts) do
           :ok ->
@@ -39,12 +39,17 @@ defmodule Redactly.Slack.Ingestor do
             Logger.warning("[Slack] Could not delete message: #{inspect(reason)}")
         end
 
+        formatted_items =
+          pii_items
+          |> Enum.map(fn %{"type" => type, "value" => value} -> "- #{type}: #{value}" end)
+          |> Enum.join("\n")
+
         Slack.send_dm(user, """
         🚨 Your message was removed because it contained PII.
 
         Flagged items:
 
-        - #{Enum.join(pii_items, "\n- ")}
+        #{formatted_items}
 
         Original message:
 

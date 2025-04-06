@@ -13,8 +13,20 @@ defmodule Redactly.Notion do
     case Notion.fetch_page(page_id) do
       {:ok, page} ->
         content = Notion.extract_content(page)
+        block_text = Notion.fetch_block_texts(page_id)
 
-        case Scanner.scan(content) do
+        full_content =
+          [content, block_text]
+          |> Enum.reject(&(&1 == ""))
+          |> Enum.join("\n")
+
+        quoted_content =
+          full_content
+          |> String.split("\n")
+          |> Enum.map(&("> " <> &1))
+          |> Enum.join("\n")
+
+        case Scanner.scan(full_content) do
           {:ok, pii_items} ->
             Logger.info("[Notion] Detected PII — deleting page #{page_id}")
             Notion.delete_page(page_id)
@@ -27,16 +39,21 @@ defmodule Redactly.Notion do
 
             case Slack.lookup_user_by_email(user_email) do
               {:ok, slack_id} ->
+                formatted_items =
+                  pii_items
+                  |> Enum.map(fn %{"type" => type, "value" => value} -> "- #{type}: #{value}" end)
+                  |> Enum.join("\n")
+
                 Slack.send_dm(slack_id, """
                 🚨 Your Notion ticket was removed because it contained PII.
 
                 Flagged content:
 
-                #{Enum.map_join(pii_items, "\n", &"- #{&1}")}
+                #{formatted_items}
 
                 Original post:
 
-                > #{content}
+                #{quoted_content}
                 """)
 
               :error ->

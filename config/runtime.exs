@@ -142,15 +142,6 @@ if config_env() == :prod do
   #
   # Check `Plug.SSL` for all available options in `force_ssl`.
 
-  notion_db_id =
-    System.get_env("NOTION_DATABASE_ID") ||
-      raise """
-      environment variable NOTION_DATABASE_ID is missing.
-      Make sure to set it in your Fly/Gigalixir/Render env before deploying.
-      """
-
-  config :redactly, :notion, database_id: notion_db_id
-
   # ## Configuring the mailer
   #
   # In production you need to configure the mailer to use a different adapter.
