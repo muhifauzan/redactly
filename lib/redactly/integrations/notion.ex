@@ -26,8 +26,8 @@ defmodule Redactly.Integrations.Notion do
     end
   end
 
-  @spec delete_page(String.t()) :: :ok | {:error, any()}
-  def delete_page(page_id) do
+  @spec archive_page(String.t()) :: :ok | {:error, any()}
+  def archive_page(page_id) do
     url = "#{@notion_api}/pages/#{page_id}"
     body = Jason.encode!(%{"archived" => true})
 
@@ -75,28 +75,123 @@ defmodule Redactly.Integrations.Notion do
 
   @spec extract_page_content(String.t()) :: %{text: [String.t()], files: [map()]}
   def extract_page_content(page_id) do
+    properties_text = extract_page_properties(page_id)
+    {block_text, files} = extract_block_text_and_files(page_id)
+
+    %{
+      text: properties_text ++ block_text,
+      files: files
+    }
+  end
+
+  defp extract_block_text_and_files(page_id) do
     url = "#{@notion_api}/blocks/#{page_id}/children?page_size=100"
 
-    case Finch.build(:get, url, headers())
-         |> Finch.request(Redactly.Finch) do
+    case Finch.build(:get, url, headers()) |> Finch.request(Redactly.Finch) do
       {:ok, %Finch.Response{status: 200, body: body}} ->
         case Jason.decode(body) do
           {:ok, %{"results" => blocks}} ->
-            Enum.reduce(blocks, %{text: [], files: []}, fn block, acc ->
+            Enum.reduce(blocks, {[], []}, fn block, {text_acc, file_acc} ->
               case block do
-                %{"type" => "paragraph", "paragraph" => %{"rich_text" => rich_text}} ->
-                  lines = Enum.map(rich_text, fn %{"plain_text" => t} -> t end)
-                  %{acc | text: acc.text ++ lines}
+                %{"type" => type} ->
+                  case Map.get(block, type) do
+                    %{"rich_text" => rich_text} when is_list(rich_text) ->
+                      lines =
+                        Enum.map(rich_text, fn %{"plain_text" => t} -> t end)
 
-                %{"type" => block_type} ->
-                  case Map.get(block, block_type) do
+                      {text_acc ++ lines, file_acc}
+
                     %{"type" => "file", "file" => %{"url" => url}} ->
+                      filename = url |> String.split("?") |> hd() |> Path.basename()
+                      line = "[file: #{filename}]"
+
                       case download_file(url) do
                         {:ok, data} ->
-                          mime = guess_mime_type(url)
-                          file = %{name: Path.basename(url), mime_type: mime, data: data}
-                          %{acc | files: [file | acc.files]}
+                          file = %{
+                            name: filename,
+                            mime_type: guess_mime_type(url),
+                            data: data
+                          }
 
+                          {text_acc ++ [line], [file | file_acc]}
+
+                        _ ->
+                          Logger.warning("[Notion] Failed to download file from #{url}")
+                          {text_acc ++ [line], file_acc}
+                      end
+
+                    _ ->
+                      {text_acc, file_acc}
+                  end
+
+                _ ->
+                  {text_acc, file_acc}
+              end
+            end)
+
+          _ ->
+            Logger.error("[Notion] Unexpected body when fetching blocks")
+            {[], []}
+        end
+
+      {:ok, %Finch.Response{status: status, body: body}} ->
+        Logger.error("[Notion] Failed to fetch blocks (#{status}): #{body}")
+        {[], []}
+
+      {:error, reason} ->
+        Logger.error("[Notion] Error fetching blocks: #{inspect(reason)}")
+        {[], []}
+    end
+  end
+
+  defp extract_page_properties(page_id) do
+    url = "#{@notion_api}/pages/#{page_id}"
+
+    case Finch.build(:get, url, headers()) |> Finch.request(Redactly.Finch) do
+      {:ok, %Finch.Response{status: 200, body: body}} ->
+        case Jason.decode(body) do
+          {:ok, %{"properties" => props}} ->
+            Enum.map(props, fn {name, value} ->
+              text = extract_property(value)
+              "#{name}: #{text}"
+            end)
+
+          _ ->
+            Logger.warning("[Notion] No properties in page #{page_id}")
+            []
+        end
+
+      {:ok, %Finch.Response{status: status, body: body}} ->
+        Logger.error("[Notion] Failed to fetch page props (#{status}): #{body}")
+        []
+
+      {:error, reason} ->
+        Logger.error("[Notion] Error fetching page props: #{inspect(reason)}")
+        []
+    end
+  end
+
+  defp extract_files_from_blocks(page_id) do
+    url = "#{@notion_api}/blocks/#{page_id}/children?page_size=100"
+
+    case Finch.build(:get, url, headers()) |> Finch.request(Redactly.Finch) do
+      {:ok, %Finch.Response{status: 200, body: body}} ->
+        case Jason.decode(body) do
+          {:ok, %{"results" => blocks}} ->
+            Enum.reduce(blocks, [], fn block, acc ->
+              case block do
+                %{"type" => type} ->
+                  case Map.get(block, type) do
+                    %{"type" => "file", "file" => %{"url" => url}} ->
+                      with {:ok, data} <- download_file(url) do
+                        file = %{
+                          name: url |> String.split("?") |> hd() |> Path.basename(),
+                          mime_type: guess_mime_type(url),
+                          data: data
+                        }
+
+                        [file | acc]
+                      else
                         _ ->
                           Logger.warning("[Notion] Skipping failed file download from #{url}")
                           acc
@@ -112,17 +207,39 @@ defmodule Redactly.Integrations.Notion do
             end)
 
           _ ->
-            Logger.error("[Notion] Unexpected response body when fetching blocks")
-            %{text: [], files: []}
+            Logger.warning("[Notion] Unexpected block structure for file scan")
+            []
         end
 
       {:ok, %Finch.Response{status: status, body: body}} ->
-        Logger.error("[Notion] Failed to fetch blocks (#{status}): #{body}")
-        %{text: [], files: []}
+        Logger.error("[Notion] Failed to fetch blocks for file scan (#{status}): #{body}")
+        []
 
       {:error, reason} ->
-        Logger.error("[Notion] Error fetching blocks: #{inspect(reason)}")
-        %{text: [], files: []}
+        Logger.error("[Notion] File block fetch error: #{inspect(reason)}")
+        []
+    end
+  end
+
+  @spec fetch_user_email_from_page(String.t()) :: String.t()
+  def fetch_user_email_from_page(page_id) do
+    url = "#{@notion_api}/pages/#{page_id}"
+
+    case Finch.build(:get, url, headers())
+         |> Finch.request(Redactly.Finch) do
+      {:ok, %Finch.Response{status: 200, body: body}} ->
+        case Jason.decode(body) do
+          %{"created_by" => %{"id" => user_id}} ->
+            fetch_user_email(user_id)
+
+          _ ->
+            Logger.warning("[Notion] Could not extract created_by from page #{page_id}")
+            ""
+        end
+
+      error ->
+        Logger.error("[Notion] Could not fetch page details: #{inspect(error)}")
+        ""
     end
   end
 
@@ -155,17 +272,58 @@ defmodule Redactly.Integrations.Notion do
     end
   end
 
-  defp extract_property(%{"type" => "rich_text", "rich_text" => rich_text}) do
-    Enum.map(rich_text, fn %{"plain_text" => text} -> text end)
-    |> Enum.join()
-  end
+  defp extract_property(%{"type" => "title", "title" => title}),
+    do: join_plain_text(title)
 
-  defp extract_property(%{"type" => "title", "title" => title}) do
-    Enum.map(title, fn %{"plain_text" => text} -> text end)
-    |> Enum.join()
-  end
+  defp extract_property(%{"type" => "rich_text", "rich_text" => rich_text}),
+    do: join_plain_text(rich_text)
+
+  defp extract_property(%{"type" => "select", "select" => %{"name" => name}}),
+    do: name
+
+  defp extract_property(%{"type" => "multi_select", "multi_select" => list}) when is_list(list),
+    do: Enum.map_join(list, ", ", & &1["name"])
+
+  defp extract_property(%{"type" => "number", "number" => number}) when not is_nil(number),
+    do: to_string(number)
+
+  defp extract_property(%{"type" => "date", "date" => %{"start" => start}})
+       when not is_nil(start),
+       do: start
+
+  defp extract_property(%{"type" => "checkbox", "checkbox" => val}),
+    do: if(val, do: "✓", else: "✗")
+
+  defp extract_property(%{"type" => "people", "people" => people}) when is_list(people),
+    do: Enum.map_join(people, ", ", fn person -> person["name"] || "Unnamed" end)
+
+  defp extract_property(%{"type" => "url", "url" => url}) when is_binary(url),
+    do: url
+
+  defp extract_property(%{"type" => "relation", "relation" => rels}) when is_list(rels),
+    do: "#{length(rels)} linked"
+
+  defp extract_property(%{
+         "type" => "rollup",
+         "rollup" => %{"type" => _, "function" => _, "number" => num}
+       })
+       when is_number(num),
+       do: to_string(num)
+
+  defp extract_property(%{
+         "type" => "formula",
+         "formula" => %{"type" => "number", "number" => num}
+       })
+       when is_number(num),
+       do: to_string(num)
 
   defp extract_property(_), do: ""
+
+  defp join_plain_text(items) when is_list(items) do
+    items
+    |> Enum.map(& &1["plain_text"])
+    |> Enum.join()
+  end
 
   defp api_token do
     Application.fetch_env!(:redactly, :notion)[:api_token]

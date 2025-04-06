@@ -1,60 +1,67 @@
 defmodule Redactly.Notion do
-  @moduledoc "Coordinates Notion ticket updates and PII enforcement."
+  @moduledoc "Handles Notion events."
 
   require Logger
-
+  alias Redactly.Integrations.Slack
+  alias Redactly.Integrations.Notion, as: NotionAPI
   alias Redactly.PII.Scanner
-  alias Redactly.Integrations.{Notion, Slack}
 
-  @spec handle_updated_page(String.t(), list(map())) :: :ok
-  def handle_updated_page(page_id, authors) do
-    Logger.info("[Notion] Handling update for page #{page_id}")
+  @spec handle_updated_page(String.t(), %{text: [String.t()], files: [map()]}, String.t()) :: :ok
+  def handle_updated_page(page_id, %{text: lines, files: files}, slack_user_id) do
+    Logger.debug("[Notion] Scanning page #{page_id} for PII")
 
-    %{text: lines, files: files} = Notion.extract_page_content(page_id)
-    content = Enum.join(lines, "\n")
-
-    case Scanner.scan(content, files) do
+    case Scanner.scan(Enum.join(lines, "\n"), files) do
       {:ok, pii_items} ->
-        Logger.info("[Notion] Detected PII — deleting page #{page_id}")
-        Notion.delete_page(page_id)
+        Logger.info("[Notion] PII detected in page #{page_id}, deleting...")
 
-        user_email =
-          authors
-          |> List.first()
-          |> Map.get("id")
-          |> then(&Notion.fetch_user_email/1)
+        case NotionAPI.archive_page(page_id) do
+          :ok ->
+            grouped =
+              Enum.group_by(pii_items, fn %{"source" => src} -> src || "Message text" end)
 
-        case Slack.lookup_user_by_email(user_email) do
-          {:ok, slack_id} ->
-            Slack.send_dm(slack_id, """
+            formatted =
+              grouped
+              |> Enum.map(fn {source, items} ->
+                header =
+                  if source == "Message text" do
+                    "*In content:*"
+                  else
+                    "*In file _#{source}_:*"
+                  end
+
+                header <> "\n" <> Enum.map_join(items, "\n", &format_item/1)
+              end)
+              |> Enum.join("\n\n")
+
+            quoted =
+              lines
+              |> Enum.map(&("> " <> &1))
+              |> Enum.join("\n")
+
+            Slack.send_dm(slack_user_id, """
             🚨 Your Notion ticket was removed because it contained PII.
 
-            Flagged content:
-            #{Enum.map_join(pii_items, "\n", fn %{"type" => t, "value" => v} -> "- #{t}: #{v}" end)}
+            #{formatted}
 
-            Original post:
-            #{quote_block(content)}
+            *Original ticket:*
+            #{quoted}
             """)
 
-          :error ->
-            Logger.warning("[Notion] Could not map author email to Slack ID: #{user_email}")
+            Enum.each(files, fn file ->
+              Slack.upload_file_to_user(slack_user_id, file.name, file.data, file.mime_type)
+            end)
+
+          {:error, reason} ->
+            Logger.error("[Notion] Failed to delete page #{page_id}: #{inspect(reason)}")
         end
 
       :empty ->
         Logger.debug("[Notion] No PII found in page #{page_id}")
 
       {:error, reason} ->
-        Logger.error("[Notion] Failed to scan Notion content: #{inspect(reason)}")
+        Logger.error("[Notion] Failed to scan page #{page_id}: #{inspect(reason)}")
     end
-
-    :ok
   end
 
-  defp quote_block(text) do
-    text
-    |> String.trim()
-    |> String.split("\n")
-    |> Enum.map(&"> #{&1}")
-    |> Enum.join("\n")
-  end
+  defp format_item(%{"type" => type, "value" => value}), do: "- #{type}: #{value}"
 end
