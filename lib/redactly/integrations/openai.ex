@@ -14,10 +14,19 @@ defmodule Redactly.Integrations.OpenAI do
     file_results = Enum.map(files, &detect_file_pii/1)
 
     all_items =
-      Enum.flat_map([text_result | file_results], fn
-        {:ok, items} -> items
-        _ -> []
-      end)
+      Enum.flat_map(
+        [{:text, text_result} | Enum.zip(Enum.map(files, & &1.name), file_results)],
+        fn
+          {:text, {:ok, items}} ->
+            Enum.map(items, &Map.put(&1, "source", "Message text"))
+
+          {filename, {:ok, items}} ->
+            Enum.map(items, &Map.put(&1, "source", filename))
+
+          _ ->
+            []
+        end
+      )
 
     if all_items == [] do
       :empty

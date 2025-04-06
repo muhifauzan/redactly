@@ -14,22 +14,22 @@ defmodule Redactly.PII.Scanner do
           data: binary()
         }
 
-  @spec scan(String.t(), list(OpenAI.file())) :: {:ok, list(pii)} | :empty
-  def scan(text, files \\ []) when is_binary(text) and byte_size(text) > 0 do
-    Logger.info("[Scanner] Scanning text: #{text}")
+  @spec scan(String.t() | nil, list(file())) :: {:ok, list(pii)} | :empty | {:error, any()}
+  def scan(nil, files), do: scan("", files)
 
-    case OpenAI.detect_pii(text, files) do
-      {:ok, []} ->
-        Logger.info("[Scanner] No PII detected.")
-        :empty
+  def scan(text, files) when is_binary(text) do
+    if String.trim(text) == "" and files == [] do
+      :empty
+    else
+      case OpenAI.detect_pii(text, files) do
+        {:ok, []} ->
+          Logger.info("[Scanner] No PII detected.")
+          :empty
 
-      {:ok, items} ->
-        Logger.info("[Scanner] PII detected: #{inspect(items)}")
-        {:ok, items}
-
-      {:error, reason} ->
-        Logger.error("[Scanner] Error during detection: #{inspect(reason)}")
-        :empty
+        {:ok, items} ->
+          Logger.info("[Scanner] PII detected: #{inspect(items)}")
+          {:ok, items}
+      end
     end
   end
 end

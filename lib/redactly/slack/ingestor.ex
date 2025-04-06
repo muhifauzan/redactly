@@ -8,14 +8,14 @@ defmodule Redactly.Slack.Ingestor do
 
   @spec handle_event(map()) :: :ok
 
-  def handle_event(%{"event" => %{"subtype" => subtype}} = event)
+  def handle_event(%{"event" => %{"subtype" => subtype}})
       when subtype in ["message_changed", "message_deleted", "bot_message"] do
     Logger.debug("[Slack] Ignoring message with subtype #{subtype}")
     :ok
   end
 
-  def handle_event(%{"event" => %{"bot_id" => bot_id}}) do
-    Logger.debug("[Slack] Ignoring message from bot_id #{bot_id}")
+  def handle_event(%{"event" => %{"bot_id" => _}}) do
+    Logger.debug("[Slack] Ignoring message from another bot")
     :ok
   end
 
@@ -28,7 +28,9 @@ defmodule Redactly.Slack.Ingestor do
 
     Logger.info("[Slack] Received message from #{user}: #{inspect(text)}")
 
-    downloaded_files = Enum.map(files, &download_slack_file/1) |> Enum.filter(& &1)
+    downloaded_files =
+      Enum.map(files, &download_slack_file/1)
+      |> Enum.filter(& &1)
 
     case Scanner.scan(text, downloaded_files) do
       {:ok, pii_items} ->
@@ -43,28 +45,44 @@ defmodule Redactly.Slack.Ingestor do
             Logger.warning("[Slack] Could not delete message: #{inspect(reason)}")
         end
 
-        formatted_items =
+        # 🧠 Group flagged items by source
+        grouped =
           pii_items
-          |> Enum.map(fn %{"type" => type, "value" => value} -> "- #{type}: #{value}" end)
-          |> Enum.join("\n")
+          |> Enum.group_by(fn %{"source" => src} -> src || "Message text" end)
+
+        formatted =
+          Enum.map(grouped, fn {source, items} ->
+            case source do
+              "Message text" ->
+                "*In message text:*\n" <> Enum.map_join(items, "\n", &format_item/1)
+
+              other ->
+                "*In file _#{other}_:*\n" <> Enum.map_join(items, "\n", &format_item/1)
+            end
+          end)
+          |> Enum.join("\n\n")
 
         quoted_text =
-          text
-          |> String.split("\n")
-          |> Enum.map(&("> " <> &1))
-          |> Enum.join("\n")
+          if text && String.trim(text) != "" do
+            "\n\nOriginal message:\n" <>
+              (text
+               |> String.split("\n")
+               |> Enum.map(&("> " <> &1))
+               |> Enum.join("\n"))
+          else
+            ""
+          end
 
         Slack.send_dm(user, """
         🚨 Your message was removed because it contained PII.
 
-        Flagged items:
-
-        #{formatted_items}
-
-        Original message:
-
-        #{quoted_text}
+        #{formatted}#{quoted_text}
         """)
+
+        # ✅ Send all files (flagged or not) back to the user
+        Enum.each(downloaded_files, fn %{name: name, data: data, mime_type: mime} ->
+          Slack.upload_file_to_user(user, name, data, mime)
+        end)
 
       :empty ->
         Logger.debug("[Slack] No PII detected")
@@ -82,9 +100,7 @@ defmodule Redactly.Slack.Ingestor do
   end
 
   defp download_slack_file(%{"url_private" => url, "name" => name, "mimetype" => mime}) do
-    headers = [
-      {"Authorization", "Bearer #{bot_token()}"}
-    ]
+    headers = [{"Authorization", "Bearer #{bot_token()}"}]
 
     case Finch.build(:get, url, headers) |> Finch.request(Redactly.Finch) do
       {:ok, %Finch.Response{status: 200, body: body}} ->
@@ -106,4 +122,6 @@ defmodule Redactly.Slack.Ingestor do
   defp bot_token do
     Application.fetch_env!(:redactly, :slack)[:bot_token]
   end
+
+  defp format_item(%{"type" => type, "value" => value}), do: "- #{type}: #{value}"
 end
