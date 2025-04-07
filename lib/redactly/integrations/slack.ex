@@ -1,239 +1,211 @@
 defmodule Redactly.Integrations.Slack do
-  @moduledoc """
-  Slack Web API integration.
-  """
+  @moduledoc "Slack Web API integration using Req."
+
+  alias Redactly.Integrations.FileUtils
 
   require Logger
 
-  alias Finch.Response
-  alias Multipart.Part
-
-  @slack_api "https://slack.com/api"
-  @headers [{"Content-Type", "application/json; charset=utf-8"}]
+  @base_url "https://slack.com/api"
 
   @spec delete_message(String.t(), String.t()) :: :ok | {:error, any()}
   def delete_message(channel, ts) do
-    body = Jason.encode!(%{"channel" => channel, "ts" => ts})
+    req = client(user_token())
 
-    Finch.build(:post, "#{@slack_api}/chat.delete", user_auth_headers(), body)
-    |> Finch.request(Redactly.Finch)
-    |> handle_response(fn ->
+    Req.post(req, url: "/chat.delete", json: %{"channel" => channel, "ts" => ts})
+    |> handle_response("delete", nil, fn _ ->
       Logger.info("[Slack] Deleted message at #{ts} in #{channel}")
     end)
   end
 
   @spec send_dm(String.t(), String.t()) :: :ok | {:error, any()}
   def send_dm(user_id, text) do
-    conv_body = Jason.encode!(%{"users" => user_id})
+    req = client(bot_token())
 
-    with {:ok, %Response{status: 200, body: conv_json}} <-
-           Finch.build(:post, "#{@slack_api}/conversations.open", bot_auth_headers(), conv_body)
-           |> Finch.request(Redactly.Finch),
-         {:ok, %{"ok" => true, "channel" => %{"id" => channel_id}}} <- Jason.decode(conv_json) do
-      msg_body = Jason.encode!(%{"channel" => channel_id, "text" => text})
-
-      Finch.build(:post, "#{@slack_api}/chat.postMessage", bot_auth_headers(), msg_body)
-      |> Finch.request(Redactly.Finch)
-      |> handle_response(fn ->
-        Logger.info("[Slack] DM sent to user #{user_id}")
-      end)
+    with {:ok, channel_id} <- open_conversation(req, user_id),
+         :ok <- post_message(req, channel_id, text) do
+      Logger.info("[Slack] DM sent to user #{user_id}")
+      :ok
     else
-      {:ok, %{"error" => error}} ->
-        Logger.error("[Slack] Failed to open conversation: #{error}")
-        {:error, error}
-
-      error ->
-        Logger.error("[Slack] Failed to open conversation: #{inspect(error)}")
-        {:error, error}
+      {:error, reason} ->
+        Logger.warning("[Slack] Failed to send DM to #{user_id}: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
   @spec lookup_user_by_email(String.t()) :: {:ok, String.t()} | :error
   def lookup_user_by_email(email) do
-    url = "#{@slack_api}/users.lookupByEmail?email=#{URI.encode_www_form(email)}"
+    url = "/users.lookupByEmail?email=#{URI.encode_www_form(email)}"
+    req = client(bot_token())
 
-    case Finch.build(:get, url, bot_auth_headers())
-         |> Finch.request(Redactly.Finch) do
-      {:ok, %Response{status: 200, body: body}} ->
-        case Jason.decode(body) do
-          {:ok, %{"ok" => true, "user" => %{"id" => slack_id}}} ->
-            {:ok, slack_id}
-
-          {:ok, %{"error" => error}} ->
-            Logger.error("[Slack] Failed to find user by email: #{error}")
-            :error
-
-          _ ->
-            Logger.error("[Slack] Unexpected response body during email lookup")
-            :error
-        end
-
-      {:error, reason} ->
-        Logger.error("[Slack] Error looking up user by email: #{inspect(reason)}")
-        :error
-    end
+    Req.get(req, url: url)
+    |> handle_response(
+      "lookup_user_by_email",
+      fn %{"user" => %{"id" => id}} -> {:ok, id} end,
+      fn %{"user" => %{"id" => id}} ->
+        Logger.debug("[Slack] Resolved email #{email} to user ID #{id}")
+      end
+    )
   end
 
   @spec upload_file_to_user(String.t(), String.t(), binary(), String.t()) :: :ok | {:error, any()}
   def upload_file_to_user(user_id, filename, data, mime_type) do
-    with {:ok, channel_id} <- open_dm_channel(user_id),
+    with {:ok, channel_id} <- open_conversation(client(bot_token()), user_id),
          {:ok, upload_url, file_id} <- get_upload_url(filename, byte_size(data), mime_type),
          :ok <-
            upload_file_to_url(upload_url, %{filename: filename, data: data, mime_type: mime_type}),
          :ok <- complete_upload(file_id, channel_id, filename) do
-      Logger.info("[Slack] File uploaded to user #{user_id}")
+      Logger.info("[Slack] File #{filename} uploaded to user #{user_id}")
       :ok
     else
       {:error, reason} ->
-        Logger.error("[Slack] File upload failed: #{inspect(reason)}")
+        Logger.warning("[Slack] File upload failed for #{filename}: #{inspect(reason)}")
         {:error, reason}
     end
   end
 
-  defp open_dm_channel(user_id) do
-    body = Jason.encode!(%{"users" => user_id})
-
-    Finch.build(:post, "#{@slack_api}/conversations.open", bot_auth_headers(), body)
-    |> Finch.request(Redactly.Finch)
-    |> case do
-      {:ok, %Response{status: 200, body: body}} ->
-        case Jason.decode(body) do
-          {:ok, %{"ok" => true, "channel" => %{"id" => channel_id}}} ->
-            {:ok, channel_id}
-
-          {:ok, %{"error" => error}} ->
-            {:error, error}
-
-          _ ->
-            {:error, :unexpected_response}
-        end
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+  def download_file(url) do
+    FileUtils.download(url, [{"Authorization", "Bearer #{bot_token()}"}])
   end
 
-  defp get_upload_url(filename, length, mime_type) do
-    body =
-      URI.encode_query(%{
-        "token" => System.get_env("SLACK_BOT_TOKEN"),
+  ## Private
+
+  defp get_upload_url(filename, length, _mime_type) do
+    Req.post(client(bot_token()),
+      url: "/files.getUploadURLExternal",
+      form: %{
         "filename" => filename,
-        "length" => length
-      })
-
-    headers = [
-      {"Content-Type", "application/x-www-form-urlencoded"}
-    ]
-
-    Finch.build(:post, "https://slack.com/api/files.getUploadURLExternal", headers, body)
-    |> Finch.request(Redactly.Finch)
-    |> case do
-      {:ok, %Response{status: 200, body: body}} ->
-        case Jason.decode(body) do
-          {:ok, %{"ok" => true, "upload_url" => upload_url, "file_id" => file_id}} ->
-            {:ok, upload_url, file_id}
-
-          {:ok, %{"error" => error}} ->
-            Logger.error("Failed to get upload URL: #{error}")
-            {:error, error}
-
-          _ ->
-            Logger.error("Unexpected response body during get upload URL")
-            {:error, :unexpected_response}
-        end
-
-      {:error, reason} ->
-        Logger.error("Error getting upload URL: #{inspect(reason)}")
-        {:error, reason}
-    end
+        "length" => to_string(length)
+      }
+    )
+    |> handle_response(
+      "get_upload_url",
+      fn %{"upload_url" => url, "file_id" => id} -> {:ok, url, id} end,
+      fn _ ->
+        Logger.debug("[Slack] Got presigned upload URL for #{filename}")
+      end
+    )
   end
 
-  defp upload_file_to_url(upload_url, %{filename: filename, data: data, mime_type: mime_type}) do
+  defp upload_file_to_url(url, %{filename: filename, data: data, mime_type: mime}) do
     multipart =
       Multipart.new()
       |> Multipart.add_part(
-        Part.binary_body(data, [
+        Multipart.Part.binary_body(data, [
           {"content-disposition", ~s(form-data; name="file"; filename="#{filename}")},
-          {"content-type", mime_type}
+          {"content-type", mime}
         ])
       )
 
-    body_stream = Multipart.body_stream(multipart)
-    content_length = Multipart.content_length(multipart)
-    content_type = Multipart.content_type(multipart, "multipart/form-data")
-
     headers = [
-      {"Content-Type", content_type},
-      {"Content-Length", to_string(content_length)}
+      {"Content-Type", Multipart.content_type(multipart, "multipart/form-data")},
+      {"Content-Length", Multipart.content_length(multipart) |> to_string()}
     ]
 
-    Finch.build(:post, upload_url, headers, {:stream, body_stream})
-    |> Finch.request(Redactly.Finch)
+    Req.post(
+      Req.new(finch: Redactly.Finch),
+      url: url,
+      headers: headers,
+      body: Multipart.body_stream(multipart)
+    )
     |> case do
-      {:ok, %Response{status: 200}} ->
-        Logger.debug("[Slack] File uploaded to presigned URL successfully")
+      {:ok, %{status: 200}} ->
+        Logger.debug("[Slack] File uploaded to presigned URL for #{filename}")
         :ok
 
-      {:ok, %Response{status: status, body: body}} ->
-        Logger.error("[Slack] Multipart upload failed with status #{status}: #{inspect(body)}")
-        {:error, :multipart_failed}
+      {:ok, %{status: status, body: body}} ->
+        Logger.error("[Slack] Upload failed with status #{status}: #{inspect(body)}")
+        {:error, :upload_failed}
 
       {:error, reason} ->
-        Logger.error("[Slack] File PUT failed: #{inspect(reason)}")
+        Logger.error("[Slack] Upload request error: #{inspect(reason)}")
         {:error, reason}
     end
   end
 
   defp complete_upload(file_id, channel_id, filename) do
-    body =
-      Jason.encode!(%{
+    Req.post(client(bot_token()),
+      url: "/files.completeUploadExternal",
+      json: %{
         "channel_id" => channel_id,
-        "files" => [
-          %{
-            "id" => file_id,
-            "title" => filename
-          }
-        ]
-      })
+        "files" => [%{"id" => file_id, "title" => filename}]
+      }
+    )
+    |> handle_response("complete_upload", nil, fn _ ->
+      Logger.debug("[Slack] Completed upload for #{filename}")
+    end)
+  end
 
-    Finch.build(:post, "#{@slack_api}/files.completeUploadExternal", bot_auth_headers(), body)
-    |> Finch.request(Redactly.Finch)
-    |> case do
-      {:ok, %Response{status: 200, body: body}} ->
-        case Jason.decode(body) do
-          {:ok, %{"ok" => true}} -> :ok
-          {:ok, %{"error" => error}} -> {:error, error}
-          _ -> {:error, :unexpected_response}
-        end
+  ## Private
 
-      {:error, reason} ->
-        {:error, reason}
+  defp open_conversation(req, user_id) do
+    Req.post(req, url: "/conversations.open", json: %{"users" => user_id})
+    |> handle_response(
+      "open_conversation",
+      fn %{"channel" => %{"id" => id}} -> {:ok, id} end,
+      fn _ ->
+        Logger.debug("[Slack] Opened DM channel for user #{user_id}")
+      end
+    )
+  end
+
+  defp post_message(req, channel_id, text) do
+    Req.post(req, url: "/chat.postMessage", json: %{"channel" => channel_id, "text" => text})
+    |> handle_response("post_message", nil, fn _ ->
+      Logger.debug("[Slack] Sent message to channel #{channel_id}")
+    end)
+  end
+
+  defp handle_response({:ok, %{body: %{"ok" => true} = body}}, _label, value_fun, log_fun) do
+    if is_function(log_fun, 1) do
+      log_fun.(body)
+    end
+
+    if is_function(value_fun, 1) do
+      value_fun.(body)
+    else
+      :ok
     end
   end
 
-  defp handle_response({:ok, %Response{status: 200, body: body}}, success_log_fn) do
-    case Jason.decode(body) do
-      {:ok, %{"ok" => true}} ->
-        success_log_fn.()
-        :ok
+  defp handle_response({:ok, %{body: %{"error" => error}}}, label, _, _) do
+    level =
+      if error in ["users_not_found", "channel_not_found"] do
+        :warning
+      else
+        :error
+      end
 
-      {:ok, %{"ok" => false, "error" => error}} ->
-        {:error, error}
-
-      _ ->
-        {:error, :unexpected_response}
-    end
+    Logger.log(level, "[Slack] Slack API error in #{label}: #{error}")
+    {:error, error}
   end
 
-  defp handle_response({:error, reason}, _), do: {:error, reason}
-
-  defp bot_auth_headers do
-    bot_token = Application.fetch_env!(:redactly, :slack)[:bot_token]
-    [{"Authorization", "Bearer #{bot_token}"} | @headers]
+  defp handle_response({:error, reason}, label, _, _) do
+    Logger.error("[Slack] HTTP error in #{label}: #{inspect(reason)}")
+    {:error, reason}
   end
 
-  defp user_auth_headers do
-    user_token = Application.fetch_env!(:redactly, :slack)[:user_token]
-    [{"Authorization", "Bearer #{user_token}"} | @headers]
+  defp client(token) do
+    Req.new(
+      base_url: @base_url,
+      finch: Redactly.Finch,
+      retry: :safe_transient,
+      json: true,
+      headers: [
+        {"Authorization", "Bearer #{token}"}
+      ]
+    )
+    |> Req.merge(req_options())
+  end
+
+  defp req_options do
+    Application.get_env(:redactly, :slack_req_options)
+  end
+
+  defp bot_token do
+    Application.fetch_env!(:redactly, :slack)[:bot_token]
+  end
+
+  defp user_token do
+    Application.fetch_env!(:redactly, :slack)[:user_token]
   end
 end

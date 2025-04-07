@@ -1,9 +1,12 @@
-defmodule Redactly.Slack.Ingestor do
+defmodule Redactly.Slack do
   @moduledoc """
   Handles incoming Slack messages via Events API.
   """
 
+  alias Redactly.Integrations.Slack, as: SlackAPI
+
   require Logger
+
   alias Redactly.{PII.Scanner, Integrations.Slack}
 
   @spec handle_event(map()) :: :ok
@@ -100,27 +103,14 @@ defmodule Redactly.Slack.Ingestor do
   end
 
   defp download_slack_file(%{"url_private" => url, "name" => name, "mimetype" => mime}) do
-    headers = [{"Authorization", "Bearer #{bot_token()}"}]
-
-    case Finch.build(:get, url, headers) |> Finch.request(Redactly.Finch) do
-      {:ok, %Finch.Response{status: 200, body: body}} ->
-        Logger.debug("[Slack] Downloaded file #{name} (#{mime})")
-        %{name: name, mime_type: mime, data: body}
-
-      {:ok, %Finch.Response{status: status}} ->
-        Logger.warning("[Slack] Failed to fetch file #{name} (status: #{status})")
-        nil
-
-      {:error, reason} ->
-        Logger.error("[Slack] Error downloading file #{name}: #{inspect(reason)}")
+    with {:ok, data} <- SlackAPI.download_file(url) do
+      Logger.debug("[Slack] Downloaded file #{name} (#{mime})")
+      %{name: name, mime_type: mime, data: data}
+    else
+      _ ->
+        Logger.warning("[Slack] Failed to download #{name}")
         nil
     end
-  end
-
-  defp download_slack_file(_), do: nil
-
-  defp bot_token do
-    Application.fetch_env!(:redactly, :slack)[:bot_token]
   end
 
   defp format_item(%{"type" => type, "value" => value}), do: "- #{type}: #{value}"

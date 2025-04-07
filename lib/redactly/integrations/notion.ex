@@ -1,75 +1,51 @@
 defmodule Redactly.Integrations.Notion do
   @moduledoc "Handles Notion API interactions."
 
+  alias Redactly.Integrations.FileUtils
+
   require Logger
 
-  @notion_api "https://api.notion.com/v1"
-
-  @spec query_database(String.t()) :: list(map())
-  def query_database(database_id) do
-    url = "#{@notion_api}/databases/#{database_id}/query"
-    body = Jason.encode!(%{})
-
-    case Finch.build(:post, url, headers(), body)
-         |> Finch.request(Redactly.Finch) do
-      {:ok, %Finch.Response{status: 200, body: body}} ->
-        %{"results" => results} = Jason.decode!(body)
-        results
-
-      {:ok, %Finch.Response{status: status, body: body}} ->
-        Logger.error("[Notion] Query failed (#{status}): #{body}")
-        []
-
-      {:error, reason} ->
-        Logger.error("[Notion] Query error: #{inspect(reason)}")
-        []
-    end
-  end
+  @base_url "https://api.notion.com/v1"
 
   @spec archive_page(String.t()) :: :ok | {:error, any()}
   def archive_page(page_id) do
-    url = "#{@notion_api}/pages/#{page_id}"
-    body = Jason.encode!(%{"archived" => true})
-
-    case Finch.build(:patch, url, headers(), body)
-         |> Finch.request(Redactly.Finch) do
-      {:ok, %Finch.Response{status: 200}} ->
-        Logger.info("[Notion] Deleted page #{page_id}")
-        :ok
-
-      {:ok, %Finch.Response{status: status, body: body}} ->
-        Logger.error("[Notion] Failed to delete page (#{status}): #{body}")
-        {:error, body}
-
-      {:error, reason} ->
-        Logger.error("[Notion] Failed to delete page: #{inspect(reason)}")
-        {:error, reason}
-    end
+    Req.patch(client(), url: "/pages/#{page_id}", json: %{"archived" => true})
+    |> handle_response("archive_page", nil, fn _ ->
+      Logger.info("[Notion] Archived page #{page_id}")
+    end)
   end
 
   @spec fetch_user_email(String.t()) :: String.t()
   def fetch_user_email(notion_user_id) do
-    url = "#{@notion_api}/users/#{notion_user_id}"
+    Req.get(client(), url: "/users/#{notion_user_id}")
+    |> handle_response(
+      "fetch_user_email",
+      fn
+        %{"person" => %{"email" => email}} -> email
+        _ -> ""
+      end,
+      fn _ ->
+        Logger.debug("[Notion] Fetched email for user #{notion_user_id}")
+      end
+    )
+  rescue
+    _ -> ""
+  end
 
-    case Finch.build(:get, url, headers())
-         |> Finch.request(Redactly.Finch) do
-      {:ok, %Finch.Response{status: 200, body: body}} ->
-        case Jason.decode!(body) do
-          %{"person" => %{"email" => email}} ->
-            email
+  @spec fetch_user_email_from_page(String.t()) :: String.t()
+  def fetch_user_email_from_page(page_id) do
+    Req.get(client(), url: "/pages/#{page_id}")
+    |> handle_response("fetch_user_email_from_page", fn
+      %{"created_by" => %{"id" => user_id}} ->
+        fetch_user_email(user_id)
 
-          _ ->
-            Logger.warning("[Notion] User #{notion_user_id} has no email")
-            ""
-        end
-
-      {:ok, %Finch.Response{status: status, body: body}} ->
-        Logger.error("[Notion] Failed to fetch user email (#{status}): #{body}")
+      _ ->
+        Logger.warning("[Notion] Could not extract created_by from page #{page_id}")
         ""
-
-      {:error, reason} ->
-        Logger.error("[Notion] Error fetching user email: #{inspect(reason)}")
-        ""
+    end)
+    |> case do
+      {:ok, email} -> email
+      {:error, _} -> ""
     end
   end
 
@@ -84,191 +60,72 @@ defmodule Redactly.Integrations.Notion do
     }
   end
 
+  ## Private
+
   defp extract_block_text_and_files(page_id) do
-    url = "#{@notion_api}/blocks/#{page_id}/children?page_size=100"
+    Req.get(client(),
+      url: "/blocks/#{page_id}/children?page_size=100",
+      headers: [{"Content-Type", ""}]
+    )
+    |> handle_response("extract_block_text_and_files", fn %{"results" => blocks} ->
+      Enum.reduce(blocks, {[], []}, fn block, {text_acc, file_acc} ->
+        case block do
+          %{"type" => type} ->
+            case Map.get(block, type) do
+              %{"rich_text" => rich_text} when is_list(rich_text) ->
+                lines = Enum.map(rich_text, & &1["plain_text"])
+                {text_acc ++ lines, file_acc}
 
-    case Finch.build(:get, url, headers()) |> Finch.request(Redactly.Finch) do
-      {:ok, %Finch.Response{status: 200, body: body}} ->
-        case Jason.decode(body) do
-          {:ok, %{"results" => blocks}} ->
-            Enum.reduce(blocks, {[], []}, fn block, {text_acc, file_acc} ->
-              case block do
-                %{"type" => type} ->
-                  case Map.get(block, type) do
-                    %{"rich_text" => rich_text} when is_list(rich_text) ->
-                      lines =
-                        Enum.map(rich_text, fn %{"plain_text" => t} -> t end)
+              %{"type" => "file", "file" => %{"url" => url}} ->
+                filename = url |> String.split("?") |> hd() |> Path.basename()
+                line = "[file: #{filename}]"
 
-                      {text_acc ++ lines, file_acc}
+                case FileUtils.download(url) do
+                  {:ok, data} ->
+                    file = %{
+                      name: filename,
+                      mime_type: FileUtils.guess_mime_type(url),
+                      data: data
+                    }
 
-                    %{"type" => "file", "file" => %{"url" => url}} ->
-                      filename = url |> String.split("?") |> hd() |> Path.basename()
-                      line = "[file: #{filename}]"
+                    {text_acc ++ [line], [file | file_acc]}
 
-                      case download_file(url) do
-                        {:ok, data} ->
-                          file = %{
-                            name: filename,
-                            mime_type: guess_mime_type(url),
-                            data: data
-                          }
+                  _ ->
+                    Logger.warning("[Notion] Failed to download file from #{url}")
+                    {text_acc ++ [line], file_acc}
+                end
 
-                          {text_acc ++ [line], [file | file_acc]}
-
-                        _ ->
-                          Logger.warning("[Notion] Failed to download file from #{url}")
-                          {text_acc ++ [line], file_acc}
-                      end
-
-                    _ ->
-                      {text_acc, file_acc}
-                  end
-
-                _ ->
-                  {text_acc, file_acc}
-              end
-            end)
+              _ ->
+                {text_acc, file_acc}
+            end
 
           _ ->
-            Logger.error("[Notion] Unexpected body when fetching blocks")
-            {[], []}
+            {text_acc, file_acc}
         end
-
-      {:ok, %Finch.Response{status: status, body: body}} ->
-        Logger.error("[Notion] Failed to fetch blocks (#{status}): #{body}")
-        {[], []}
-
-      {:error, reason} ->
-        Logger.error("[Notion] Error fetching blocks: #{inspect(reason)}")
-        {[], []}
+      end)
+    end)
+    |> case do
+      {:ok, result} -> result
+      {:error, _} -> {[], []}
     end
   end
 
   defp extract_page_properties(page_id) do
-    url = "#{@notion_api}/pages/#{page_id}"
+    Req.get(client(), url: "/pages/#{page_id}")
+    |> handle_response("extract_page_properties", fn
+      %{"properties" => props} ->
+        Enum.map(props, fn {name, value} ->
+          text = extract_property(value)
+          "#{name}: #{text}"
+        end)
 
-    case Finch.build(:get, url, headers()) |> Finch.request(Redactly.Finch) do
-      {:ok, %Finch.Response{status: 200, body: body}} ->
-        case Jason.decode(body) do
-          {:ok, %{"properties" => props}} ->
-            Enum.map(props, fn {name, value} ->
-              text = extract_property(value)
-              "#{name}: #{text}"
-            end)
-
-          _ ->
-            Logger.warning("[Notion] No properties in page #{page_id}")
-            []
-        end
-
-      {:ok, %Finch.Response{status: status, body: body}} ->
-        Logger.error("[Notion] Failed to fetch page props (#{status}): #{body}")
+      _ ->
+        Logger.warning("[Notion] No properties in page #{page_id}")
         []
-
-      {:error, reason} ->
-        Logger.error("[Notion] Error fetching page props: #{inspect(reason)}")
-        []
-    end
-  end
-
-  defp extract_files_from_blocks(page_id) do
-    url = "#{@notion_api}/blocks/#{page_id}/children?page_size=100"
-
-    case Finch.build(:get, url, headers()) |> Finch.request(Redactly.Finch) do
-      {:ok, %Finch.Response{status: 200, body: body}} ->
-        case Jason.decode(body) do
-          {:ok, %{"results" => blocks}} ->
-            Enum.reduce(blocks, [], fn block, acc ->
-              case block do
-                %{"type" => type} ->
-                  case Map.get(block, type) do
-                    %{"type" => "file", "file" => %{"url" => url}} ->
-                      with {:ok, data} <- download_file(url) do
-                        file = %{
-                          name: url |> String.split("?") |> hd() |> Path.basename(),
-                          mime_type: guess_mime_type(url),
-                          data: data
-                        }
-
-                        [file | acc]
-                      else
-                        _ ->
-                          Logger.warning("[Notion] Skipping failed file download from #{url}")
-                          acc
-                      end
-
-                    _ ->
-                      acc
-                  end
-
-                _ ->
-                  acc
-              end
-            end)
-
-          _ ->
-            Logger.warning("[Notion] Unexpected block structure for file scan")
-            []
-        end
-
-      {:ok, %Finch.Response{status: status, body: body}} ->
-        Logger.error("[Notion] Failed to fetch blocks for file scan (#{status}): #{body}")
-        []
-
-      {:error, reason} ->
-        Logger.error("[Notion] File block fetch error: #{inspect(reason)}")
-        []
-    end
-  end
-
-  @spec fetch_user_email_from_page(String.t()) :: String.t()
-  def fetch_user_email_from_page(page_id) do
-    url = "#{@notion_api}/pages/#{page_id}"
-
-    case Finch.build(:get, url, headers())
-         |> Finch.request(Redactly.Finch) do
-      {:ok, %Finch.Response{status: 200, body: body}} ->
-        case Jason.decode(body) do
-          %{"created_by" => %{"id" => user_id}} ->
-            fetch_user_email(user_id)
-
-          _ ->
-            Logger.warning("[Notion] Could not extract created_by from page #{page_id}")
-            ""
-        end
-
-      error ->
-        Logger.error("[Notion] Could not fetch page details: #{inspect(error)}")
-        ""
-    end
-  end
-
-  defp download_file(url) do
-    # <-- no headers here!
-    Finch.build(:get, url)
-    |> Finch.request(Redactly.Finch)
+    end)
     |> case do
-      {:ok, %Finch.Response{status: 200, body: body}} ->
-        {:ok, body}
-
-      error ->
-        Logger.error("[Notion] File download failed: #{inspect(error)}")
-        :error
-    end
-  end
-
-  defp guess_mime_type(url) do
-    url
-    |> String.split("?")
-    |> hd()
-    |> Path.extname()
-    |> String.downcase()
-    |> case do
-      ".jpg" -> "image/jpeg"
-      ".jpeg" -> "image/jpeg"
-      ".png" -> "image/png"
-      ".pdf" -> "application/pdf"
-      _ -> "application/octet-stream"
+      {:ok, lines} -> lines
+      {:error, _} -> []
     end
   end
 
@@ -325,15 +182,48 @@ defmodule Redactly.Integrations.Notion do
     |> Enum.join()
   end
 
+  defp client do
+    Req.new(
+      base_url: @base_url,
+      finch: Redactly.Finch,
+      retry: :safe_transient,
+      json: true,
+      headers: [
+        {"Authorization", "Bearer #{api_token()}"},
+        {"Notion-Version", "2022-06-28"},
+        {"Content-Type", "application/json"}
+      ]
+    )
+    |> Req.merge(req_options())
+  end
+
+  defp req_options do
+    Application.get_env(:redactly, :notion_req_options)
+  end
+
   defp api_token do
     Application.fetch_env!(:redactly, :notion)[:api_token]
   end
 
-  defp headers do
-    [
-      {"Authorization", "Bearer #{api_token()}"},
-      {"Notion-Version", "2022-06-28"},
-      {"Content-Type", "application/json"}
-    ]
+  defp handle_response(response, label, value_fun, log_fun \\ nil)
+
+  defp handle_response({:ok, %{body: body}}, _label, value_fun, log_fun) when is_map(body) do
+    if is_function(log_fun, 1), do: log_fun.(body)
+
+    if is_function(value_fun, 1) do
+      {:ok, value_fun.(body)}
+    else
+      :ok
+    end
+  end
+
+  defp handle_response({:ok, %{status: status, body: body}}, label, _, _) do
+    Logger.error("[Notion] Unexpected response (#{label}): #{status} - #{inspect(body)}")
+    {:error, :unexpected_response}
+  end
+
+  defp handle_response({:error, reason}, label, _, _) do
+    Logger.error("[Notion] HTTP error during #{label}: #{inspect(reason)}")
+    {:error, reason}
   end
 end

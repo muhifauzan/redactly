@@ -1,9 +1,11 @@
 defmodule Redactly.Integrations.OpenAI do
   @moduledoc "Handles communication with OpenAI for PII analysis."
 
+  alias Redactly.Integrations.FileUtils
+
   require Logger
 
-  @openai_url "https://api.openai.com/v1/chat/completions"
+  @base_url "https://api.openai.com/v1"
 
   @type pii_item :: %{optional(String.t()) => String.t()}
   @type file :: %{name: String.t(), mime_type: String.t(), data: binary()}
@@ -35,72 +37,68 @@ defmodule Redactly.Integrations.OpenAI do
     end
   end
 
+  ## Private
+
   defp detect_text_pii(text) do
     Logger.info("[OpenAI] Scanning text: #{text}")
 
-    body =
-      Jason.encode!(%{
-        model: "gpt-4o",
-        messages: [
-          %{
-            role: "system",
-            content: text_prompt()
-          },
-          %{
-            role: "user",
-            content: text
-          }
-        ],
-        response_format: %{
-          type: "json_schema",
-          json_schema: %{
-            strict: true,
-            name: "pii",
-            schema: response_schema()
-          }
+    body = %{
+      model: "gpt-4o",
+      messages: [
+        %{
+          role: "system",
+          content: text_prompt()
+        },
+        %{
+          role: "user",
+          content: text
         }
-      })
+      ],
+      response_format: %{
+        type: "json_schema",
+        json_schema: %{
+          strict: true,
+          name: "pii",
+          schema: response_schema()
+        }
+      }
+    }
 
-    Logger.debug("[OpenAI] Request body: #{body}")
-
-    Finch.build(:post, @openai_url, headers(), body)
-    |> Finch.request(Redactly.Finch)
-    |> handle_response()
+    Req.post(client(), url: "/chat/completions", json: body)
+    |> handle_response("detect_text_pii")
   end
 
   defp detect_file_pii(%{name: name, mime_type: mime, data: data}) do
     Logger.info("[OpenAI] Scanning file: #{name} (#{mime})")
 
-    case extract_images_from_file(mime, data) do
+    case FileUtils.extract_images_from_file(mime, data) do
       {:ok, image_inputs} ->
-        body =
-          Jason.encode!(%{
-            model: "gpt-4o",
-            messages: [
-              %{
-                role: "system",
-                content: image_prompt()
-              },
-              %{
-                role: "user",
-                content: image_inputs
-              }
-            ],
-            response_format: %{
-              type: "json_schema",
-              json_schema: %{
-                strict: true,
-                name: "pii",
-                schema: response_schema()
-              }
+        body = %{
+          model: "gpt-4o",
+          messages: [
+            %{
+              role: "system",
+              content: image_prompt()
+            },
+            %{
+              role: "user",
+              content: image_inputs
             }
-          })
+          ],
+          response_format: %{
+            type: "json_schema",
+            json_schema: %{
+              strict: true,
+              name: "pii",
+              schema: response_schema()
+            }
+          }
+        }
 
         Logger.debug("[OpenAI] Vision request body with #{length(image_inputs)} image(s)")
 
-        Finch.build(:post, @openai_url, headers(), body)
-        |> Finch.request(Redactly.Finch)
-        |> handle_response()
+        Req.post(client(), url: "/chat/completions", json: body)
+        |> handle_response("detect_file_pii")
 
       {:error, reason} ->
         Logger.warning("[OpenAI] Could not prepare image for #{name}: #{inspect(reason)}")
@@ -108,84 +106,46 @@ defmodule Redactly.Integrations.OpenAI do
     end
   end
 
-  defp extract_images_from_file("application/pdf", data) do
-    with {:ok, base_path} <- write_temp_file(data, ".pdf"),
-         output_prefix <- Path.rootname(base_path),
-         {_, 0} <- System.cmd("pdftoppm", ["-png", base_path, output_prefix]),
-         images <- Path.wildcard("#{output_prefix}-*.png"),
-         true <- images != [] do
-      urls =
-        images
-        |> Enum.map(&File.read!/1)
-        |> Enum.map(&base64_image_url/1)
-        |> Enum.map(&%{"type" => "image_url", "image_url" => %{"url" => &1}})
-
-      Enum.each(images, &File.rm/1)
-      File.rm(base_path)
-
-      {:ok, urls}
-    else
-      false -> {:error, "No images generated"}
-      err -> {:error, err}
-    end
-  end
-
-  defp extract_images_from_file(mime, data)
-       when mime in ["image/png", "image/jpeg"] do
-    url = base64_image_url(data)
-
-    {:ok, [%{"type" => "image_url", "image_url" => %{"url" => url}}]}
-  end
-
-  defp extract_images_from_file(mime, _), do: {:error, "Unsupported file type: #{mime}"}
-
-  defp base64_image_url(data) do
-    encoded = Base.encode64(data)
-    "data:image/png;base64,#{encoded}"
-  end
-
-  defp write_temp_file(data, ext) do
-    tmp_path = Path.join(System.tmp_dir!(), "redactly-#{System.unique_integer()}" <> ext)
-
-    case File.write(tmp_path, data) do
-      :ok -> {:ok, tmp_path}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp handle_response({:ok, %Finch.Response{status: 200, body: body}}) do
-    case Jason.decode!(body) do
-      %{"choices" => [%{"message" => %{"content" => content}} | _]} ->
-        case Jason.decode(content) do
-          {:ok, %{"items" => items}} when is_list(items) ->
-            {:ok, items}
-
-          _ ->
-            Logger.error("[OpenAI] Unexpected assistant content: #{inspect(content)}")
-            {:error, :bad_format}
-        end
+  defp handle_response(
+         {:ok, %{body: %{"choices" => [%{"message" => %{"content" => content}} | _]}}},
+         label
+       ) do
+    case Jason.decode(content) do
+      {:ok, %{"items" => items}} when is_list(items) ->
+        {:ok, items}
 
       _ ->
-        Logger.error("[OpenAI] Unexpected response: #{body}")
-        {:error, :unexpected_response}
+        Logger.error("[OpenAI] Malformed assistant content in #{label}: #{inspect(content)}")
+        {:error, :bad_format}
     end
   end
 
-  defp handle_response({:ok, %Finch.Response{status: status, body: body}}) do
-    Logger.error("[OpenAI] Failed with status #{status}: #{body}")
-    {:error, :http_error}
+  defp handle_response({:ok, %{status: status, body: body}}, label) do
+    Logger.error("[OpenAI] Unexpected response in #{label} (#{status}): #{inspect(body)}")
+    {:error, :unexpected_response}
   end
 
-  defp handle_response({:error, reason}) do
-    Logger.error("[OpenAI] Request error: #{inspect(reason)}")
+  defp handle_response({:error, reason}, label) do
+    Logger.error("[OpenAI] HTTP error in #{label}: #{inspect(reason)}")
     {:error, reason}
   end
 
-  defp headers do
-    [
-      {"Authorization", "Bearer #{api_key()}"},
-      {"Content-Type", "application/json"}
-    ]
+  defp client do
+    Req.new(
+      base_url: @base_url,
+      finch: Redactly.Finch,
+      retry: :safe_transient,
+      json: true,
+      headers: [
+        {"Authorization", "Bearer #{api_key()}"},
+        {"Content-Type", "application/json"}
+      ]
+    )
+    |> Req.merge(req_options())
+  end
+
+  defp req_options do
+    Application.get_env(:redactly, :openai_req_options)
   end
 
   defp api_key do

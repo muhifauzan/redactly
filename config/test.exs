@@ -35,3 +35,29 @@ config :phoenix, :plug_init_mode, :runtime
 # Enable helpful, but potentially expensive runtime checks
 config :phoenix_live_view,
   enable_expensive_runtime_checks: true
+
+config :redactly,
+  slack_req_options: [
+    plug: {Req.Test, Redactly.Integrations.Slack},
+    retry: false,
+    connect_options: [timeout: 500],
+    receive_timeout: 1_000
+  ],
+  notion_req_options: [
+    plug: {Req.Test, Redactly.Integrations.Notion},
+    retry: false,
+    connect_options: [timeout: 500],
+    receive_timeout: 1_000
+  ],
+  openai_req_options: [
+    plug: {Req.Test, Redactly.Integrations.OpenAI},
+    retry: false,
+    connect_options: [timeout: 500],
+    receive_timeout: 1_000
+  ],
+  fileutils_req_options: [
+    plug: {Req.Test, Redactly.Integrations.FileUtils},
+    retry: false,
+    connect_options: [timeout: 500],
+    receive_timeout: 1_000
+  ]

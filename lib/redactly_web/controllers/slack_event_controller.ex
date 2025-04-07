@@ -3,7 +3,7 @@ defmodule RedactlyWeb.SlackEventController do
 
   require Logger
 
-  alias Redactly.Slack.Ingestor
+  alias Redactly.Slack
 
   def event(conn, %{"type" => "url_verification", "challenge" => challenge}) do
     json(conn, %{challenge: challenge})
@@ -12,7 +12,7 @@ defmodule RedactlyWeb.SlackEventController do
   def event(conn, %{"type" => "event_callback"} = params) do
     Logger.debug("Slack event received: #{inspect(params)}")
 
-    Task.start(fn -> Ingestor.handle_event(params) end)
+    Task.start(fn -> Slack.handle_event(params) end)
     send_resp(conn, 200, "ok")
   end
 
